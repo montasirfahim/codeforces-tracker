@@ -103,6 +103,8 @@ def get_students(request, list_id):
     except StudentList.DoesNotExist:
         return JsonResponse({'error': 'List not found'}, status=404)
 
+import concurrent.futures
+
 @csrf_exempt
 def check_solves(request):
     if request.method != 'POST':
@@ -114,90 +116,102 @@ def check_solves(request):
         handles = data.get('handles', [])
         days = int(data.get('days', 1))
         
-        # Calculate time range
         now = datetime.now()
-        start_time = now - timedelta(days=days)
-        start_ts = int(start_time.timestamp())
+        start_ts = int((now - timedelta(days=days)).timestamp())
         end_ts = int(now.timestamp())
         
         results = {}
         ratings = {}
         errors = {}
         
-        print(f"--- API CHECK START: {len(handles)} handles, {days} days ---")
-        
-        # Helper to fetch user info in batches
-        def fetch_ratings(h_list):
+        # 1. Fetch Ratings (Batch with individual fallback)
+        def fetch_ratings_batch(h_list):
+            valid_h = [h for h in h_list if h and h not in ['—', '0', '', 'blank']]
+            if not valid_h: return
+            
             try:
-                # Filter out empty or invalid handles
-                valid_h = [h for h in h_list if h and h not in ['—', '0', '', 'blank']]
-                if not valid_h: return
-                
-                info_url = f"https://codeforces.com/api/user.info?handles={';'.join(valid_h)}"
-                info_res = requests.get(info_url, timeout=10)
-                if info_res.status_code == 200:
-                    info_data = info_res.json()
-                    if info_data['status'] == 'OK':
-                        for user_info in info_data['result']:
+                url = f"https://codeforces.com/api/user.info?handles={';'.join(valid_h)}"
+                res = requests.get(url, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data['status'] == 'OK':
+                        for user_info in data['result']:
                             ratings[user_info['handle'].lower()] = user_info.get('maxRating', 0)
-            except Exception as e:
-                print(f"Batch info error: {str(e)}")
+                        return True
+                return False
+            except:
+                return False
 
-        # Try batching info first
-        if handles:
-            batch_size = 50
-            for i in range(0, len(handles), batch_size):
-                fetch_ratings(handles[i:i+batch_size])
+        # Try batching first, then individuals if batch fails
+        batch_size = 50
+        for i in range(0, len(handles), batch_size):
+            batch = handles[i:i+batch_size]
+            if not fetch_ratings_batch(batch):
+                # Fallback to individual info for this batch
+                for h in batch:
+                    if h and h not in ['—', '0', '', 'blank']:
+                        fetch_ratings_batch([h])
 
-        # Track start time to avoid Render 30s timeout
-        view_start_time = time.time()
-        
-        for handle in handles:
-            # Check if we are approaching the 30s timeout (e.g., stop at 25s)
-            if time.time() - view_start_time > 25:
-                print("Approaching timeout, stopping processing and returning partial results.")
-                break
-
+        # 2. Fetch Solves (Using Threads to avoid 30s timeout)
+        def fetch_user_solves(handle):
             if not handle or handle in ['—', '0', '', 'blank']:
-                continue
+                return None, None
             
             h_lower = handle.lower()
             try:
+                print(f" > Fetching solves for: {handle}...")
                 url = f"https://codeforces.com/api/user.status?handle={handle}"
-                response = requests.get(url, timeout=5)
+                resp = requests.get(url, timeout=7)
+                if resp.status_code != 200:
+                    print(f" [!] Failed: {handle} (Status {resp.status_code})")
+                    return handle, f"Error {resp.status_code}"
                 
-                if response.status_code != 200:
-                    errors[handle] = f"CF Error {response.status_code}"
-                    continue
-                
-                data = response.json()
+                data = resp.json()
                 if data['status'] != 'OK':
-                    errors[handle] = data.get('comment', 'Unknown CF error')
-                    continue
+                    print(f" [!] CF Error: {handle} ({data.get('comment', 'Unknown')})")
+                    return handle, data.get('comment', 'CF Error')
                 
                 unique_problems = set()
-                all_submissions = data.get('result', [])
-                
-                for sub in all_submissions:
+                for sub in data.get('result', []):
                     if sub['verdict'] == 'OK':
-                        c_time = sub['creationTimeSeconds']
-                        if start_ts <= c_time <= end_ts:
-                            problem = sub['problem']
-                            p_id = f"{problem.get('contestId')}-{problem.get('index')}"
-                            unique_problems.add(p_id)
+                        if start_ts <= sub['creationTimeSeconds'] <= end_ts:
+                            p = sub['problem']
+                            unique_problems.add(f"{p.get('contestId')}-{p.get('index')}")
                 
-                results[h_lower] = len(unique_problems)
-                time.sleep(0.2) # Reduced sleep
+                print(f" [+] Success: {handle} ({len(unique_problems)} unique solves)")
+                return h_lower, len(unique_problems)
             except Exception as e:
-                print(f"Error for {handle}: {str(e)}")
-                errors[handle] = "Connection Error"
-        
-        print(f"--- API CHECK COMPLETE: {len(results)} success, {len(errors)} errors ---")
+                print(f" [!] Connection Error: {handle}")
+                return handle, "Timeout/Connection"
+
+        print(f"--- Starting parallel solve check for {len(handles)} students ---")
+        # Use ThreadPoolExecutor to fetch status in parallel
+        max_workers = 5 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_handle = {executor.submit(fetch_user_solves, h): h for h in handles}
+            
+            view_start_time = time.time()
+            count = 0
+            
+            for future in concurrent.futures.as_completed(future_to_handle):
+                count += 1
+                if time.time() - view_start_time > 26:
+                    print(f"\n!!! REACHED TIMEOUT LIMIT (Processed {count}/{len(handles)}) !!!")
+                    break
+                    
+                handle_or_h_lower, result = future.result()
+                if handle_or_h_lower:
+                    if isinstance(result, int):
+                        results[handle_or_h_lower] = result
+                    else:
+                        errors[handle_or_h_lower] = result
+
+        print(f"--- Check Complete: {len(results)} fetched, {len(errors)} errors ---\n")
         return JsonResponse({
             'results': results,
             'ratings': ratings,
             'errors': errors
         })
     except Exception as e:
-        print(f"CRITICAL VIEW ERROR: {str(e)}")
-        return JsonResponse({'error': 'Server processed error: ' + str(e)}, status=500)
+        print(f"CRITICAL ERROR: {str(e)}")
+        return JsonResponse({'error': str(e)}, status=500)
