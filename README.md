@@ -46,7 +46,7 @@ This project is configured for easy deployment on [Render](https://render.com/).
 2.  **Connect your GitHub repository**.
 3.  **Environment:** `Python 3`.
 4.  **Build Command:** `./build.sh` (Ensure the file is executable: `chmod a+x build.sh`).
-5.  **Start Command:** `gunicorn cf_checker_project.wsgi`
+5.  **Start Command:** `gunicorn cf_checker_project.wsgi --timeout 90`
 6.  **Add Environment Variables:**
     -   `SECRET_KEY`: A long, random string.
     -   `DEBUG`: `False`
