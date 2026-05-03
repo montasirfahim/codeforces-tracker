@@ -105,8 +105,11 @@ def get_students(request, list_id):
 
 @csrf_exempt
 def check_solves(request):
-    if request.method == 'POST':
-        import json
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Invalid request'}, status=400)
+    
+    import json
+    try:
         data = json.loads(request.body)
         handles = data.get('handles', [])
         days = int(data.get('days', 1))
@@ -121,64 +124,60 @@ def check_solves(request):
         ratings = {}
         errors = {}
         
-        print(f"\n--- Checking solves and ratings for {len(handles)} handles (Last {days} days) ---")
+        print(f"--- API CHECK START: {len(handles)} handles, {days} days ---")
         
-        # Helper to fetch user info
+        # Helper to fetch user info in batches
         def fetch_ratings(h_list):
             try:
-                info_url = f"https://codeforces.com/api/user.info?handles={';'.join(h_list)}"
-                info_res = requests.get(info_url, timeout=15)
+                # Filter out empty or invalid handles
+                valid_h = [h for h in h_list if h and h not in ['—', '0', '', 'blank']]
+                if not valid_h: return
+                
+                info_url = f"https://codeforces.com/api/user.info?handles={';'.join(valid_h)}"
+                info_res = requests.get(info_url, timeout=10)
                 if info_res.status_code == 200:
                     info_data = info_res.json()
                     if info_data['status'] == 'OK':
                         for user_info in info_data['result']:
-                            # Store with original handle case as requested by frontend
-                            ratings[user_info['handle']] = user_info.get('maxRating', 0)
-                        return True
-                return False
+                            ratings[user_info['handle'].lower()] = user_info.get('maxRating', 0)
             except Exception as e:
                 print(f"Batch info error: {str(e)}")
-                return False
 
-        # Try batching first
+        # Try batching info first
         if handles:
-            print(f"Attempting batch fetch for {len(handles)} handles...")
             batch_size = 50
             for i in range(0, len(handles), batch_size):
-                batch = handles[i:i+batch_size]
-                success = fetch_ratings(batch)
-                if not success:
-                    print(f"Batch {i//batch_size + 1} failed, attempting individual info fetches...")
-                    for h in batch:
-                        if h and h != '—' and h != '0':
-                            fetch_ratings([h])
-                            time.sleep(0.2)
-                time.sleep(0.5)
+                fetch_ratings(handles[i:i+batch_size])
 
+        # Track start time to avoid Render 30s timeout
+        view_start_time = time.time()
+        
         for handle in handles:
-            if not handle or handle == '—':
+            # Check if we are approaching the 30s timeout (e.g., stop at 25s)
+            if time.time() - view_start_time > 25:
+                print("Approaching timeout, stopping processing and returning partial results.")
+                break
+
+            if not handle or handle in ['—', '0', '', 'blank']:
                 continue
+            
+            h_lower = handle.lower()
             try:
-                print(f"Fetching status for: {handle}...", end=" ", flush=True)
                 url = f"https://codeforces.com/api/user.status?handle={handle}"
-                response = requests.get(url, timeout=10)
+                response = requests.get(url, timeout=5)
                 
                 if response.status_code != 200:
-                    print(f"FAILED (Status {response.status_code})")
-                    errors[handle] = f"CF API Error: {response.status_code}"
+                    errors[handle] = f"CF Error {response.status_code}"
                     continue
                 
                 data = response.json()
                 if data['status'] != 'OK':
-                    comment = data.get('comment', 'Unknown CF error')
-                    print(f"FAILED (CF Error: {comment})")
-                    errors[handle] = comment
+                    errors[handle] = data.get('comment', 'Unknown CF error')
                     continue
                 
                 unique_problems = set()
                 all_submissions = data.get('result', [])
                 
-                ok_count_in_range = 0
                 for sub in all_submissions:
                     if sub['verdict'] == 'OK':
                         c_time = sub['creationTimeSeconds']
@@ -186,20 +185,19 @@ def check_solves(request):
                             problem = sub['problem']
                             p_id = f"{problem.get('contestId')}-{problem.get('index')}"
                             unique_problems.add(p_id)
-                            ok_count_in_range += 1
                 
-                results[handle] = len(unique_problems)
-                print(f"SUCCESS: {len(unique_problems)} unique solves")
-                
-                time.sleep(0.5) # Be respectful to CF API
+                results[h_lower] = len(unique_problems)
+                time.sleep(0.2) # Reduced sleep
             except Exception as e:
-                print(f"ERROR: {str(e)}")
-                errors[handle] = str(e)
+                print(f"Error for {handle}: {str(e)}")
+                errors[handle] = "Connection Error"
         
-        print(f"--- Check complete. Ratings found: {len(ratings)} ---\n")
+        print(f"--- API CHECK COMPLETE: {len(results)} success, {len(errors)} errors ---")
         return JsonResponse({
             'results': results,
             'ratings': ratings,
             'errors': errors
         })
-    return JsonResponse({'error': 'Invalid request'}, status=400)
+    except Exception as e:
+        print(f"CRITICAL VIEW ERROR: {str(e)}")
+        return JsonResponse({'error': 'Server processed error: ' + str(e)}, status=500)
