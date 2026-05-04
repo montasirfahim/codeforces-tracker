@@ -16,7 +16,7 @@ def index(request):
 def ensure_permanent_list():
     name = "ICT'22 - MBSTU"
     if not StudentList.objects.filter(name=name).exists():
-        csv_path = os.path.join(settings.BASE_DIR, 'static', "CP_handel_ICT'22.csv")
+        csv_path = os.path.join(settings.BASE_DIR, 'static', "CP_handle_ICT'22.csv")
         if os.path.exists(csv_path):
             student_list = StudentList.objects.create(name=name)
             with open(csv_path, 'r', encoding='utf-8-sig') as f:
